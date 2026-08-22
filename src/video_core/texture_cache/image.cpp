@@ -175,7 +175,8 @@ Image::Image(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
         usage_flags &= ~vk::ImageUsageFlagBits::eStorage;
         format_features = FormatFeatureFlags(usage_flags);
         format_info.usage = usage_flags;
-        image_format_properties = instance->GetPhysicalDevice().getImageFormatProperties2(format_info);
+        image_format_properties =
+            instance->GetPhysicalDevice().getImageFormatProperties2(format_info);
     }
     if (image_format_properties.result == vk::Result::eErrorFormatNotSupported) {
         LOG_ERROR(Render_Vulkan, "image format {} type {} is not supported (flags {}, usage {})",

@@ -242,14 +242,14 @@ Image::Image(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
             }
             if (image_format_properties.result == vk::Result::eErrorFormatNotSupported) {
                 LOG_ERROR(Render_Vulkan,
-                         "image format {} type {} is not supported (flags {}, usage {})",
-                         vk::to_string(supported_format), vk::to_string(format_info.type),
-                         vk::to_string(format_info.flags), vk::to_string(format_info.usage));
+                          "image format {} type {} is not supported (flags {}, usage {})",
+                          vk::to_string(supported_format), vk::to_string(format_info.type),
+                          vk::to_string(format_info.flags), vk::to_string(format_info.usage));
             }
-            format_query_cache.emplace(
-                query_key, FormatQueryResult{.usage_flags = usage_flags,
-                                             .format_features = format_features,
-                                             .properties = image_format_properties});
+            format_query_cache.emplace(query_key,
+                                       FormatQueryResult{.usage_flags = usage_flags,
+                                                         .format_features = format_features,
+                                                         .properties = image_format_properties});
         }
     }
     supported_samples = image_format_properties.result == vk::Result::eSuccess

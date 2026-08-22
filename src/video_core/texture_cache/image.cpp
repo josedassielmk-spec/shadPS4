@@ -153,15 +153,30 @@ Image::Image(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
 
     constexpr auto tiling = vk::ImageTiling::eOptimal;
     const auto supported_format = instance->GetSupportedFormat(info.pixel_format, format_features);
-    const vk::PhysicalDeviceImageFormatInfo2 format_info{
+    vk::PhysicalDeviceImageFormatInfo2 format_info{
         .format = supported_format,
         .type = ConvertImageType(info.type),
         .tiling = tiling,
         .usage = usage_flags,
         .flags = flags,
     };
-    const auto image_format_properties =
+    auto image_format_properties =
         instance->GetPhysicalDevice().getImageFormatProperties2(format_info);
+    if (image_format_properties.result == vk::Result::eErrorFormatNotSupported &&
+        (usage_flags & vk::ImageUsageFlagBits::eStorage)) {
+        // Some drivers reject MutableFormat + ExtendedUsage + Storage for block-compressed
+        // formats (e.g. BC5/BC6H) even though Storage is only opportunistic here (used for
+        // uncompressed views of compressed images). Rather than proceeding and crashing in
+        // vmaCreateImage below, drop Storage and retry with the reduced usage set.
+        LOG_WARNING(Render_Vulkan,
+                    "image format {} type {} does not support usage {}, retrying without Storage",
+                    vk::to_string(supported_format), vk::to_string(format_info.type),
+                    vk::to_string(format_info.usage));
+        usage_flags &= ~vk::ImageUsageFlagBits::eStorage;
+        format_features = FormatFeatureFlags(usage_flags);
+        format_info.usage = usage_flags;
+        image_format_properties = instance->GetPhysicalDevice().getImageFormatProperties2(format_info);
+    }
     if (image_format_properties.result == vk::Result::eErrorFormatNotSupported) {
         LOG_ERROR(Render_Vulkan, "image format {} type {} is not supported (flags {}, usage {})",
                   vk::to_string(supported_format), vk::to_string(format_info.type),

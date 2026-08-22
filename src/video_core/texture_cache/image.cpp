@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <mutex>
 #include <ranges>
+#include <unordered_map>
 #include "common/assert.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -16,6 +18,43 @@ namespace VideoCore {
 using namespace Vulkan;
 
 Common::IncrementalIdProvider<u64> Image::global_image_uid{};
+
+namespace {
+
+// Querying getImageFormatProperties2 is a real driver call, and for texture-heavy games the
+// same (format, type, flags, usage) combination gets requested over and over as the texture
+// cache creates/recreates images every frame. Caching the outcome avoids re-querying the driver
+// and re-formatting/emitting the same log line thousands of times during gameplay, which was
+// showing up as stutter on drivers that reject Storage or 1D block-compressed formats.
+struct FormatQueryKey {
+    vk::Format format;
+    vk::ImageType type;
+    VkImageCreateFlags flags;
+    VkImageUsageFlags usage;
+
+    bool operator==(const FormatQueryKey&) const = default;
+};
+
+struct FormatQueryKeyHash {
+    size_t operator()(const FormatQueryKey& key) const noexcept {
+        size_t h = std::hash<u32>{}(static_cast<u32>(key.format));
+        h ^= std::hash<u32>{}(static_cast<u32>(key.type)) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<VkImageCreateFlags>{}(key.flags) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<VkImageUsageFlags>{}(key.usage) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+struct FormatQueryResult {
+    vk::ImageUsageFlags usage_flags;
+    vk::FormatFeatureFlags2 format_features;
+    vk::ResultValue<vk::ImageFormatProperties2> properties{vk::Result::eErrorUnknown, {}};
+};
+
+std::mutex format_query_cache_mutex;
+std::unordered_map<FormatQueryKey, FormatQueryResult, FormatQueryKeyHash> format_query_cache;
+
+} // namespace
 
 static vk::ImageUsageFlags ImageUsageFlags(const Vulkan::Instance* instance,
                                            const ImageInfo& info) {
@@ -153,35 +192,65 @@ Image::Image(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
 
     constexpr auto tiling = vk::ImageTiling::eOptimal;
     const auto supported_format = instance->GetSupportedFormat(info.pixel_format, format_features);
+    const vk::ImageType image_type = ConvertImageType(info.type);
+
+    const FormatQueryKey query_key{
+        .format = supported_format,
+        .type = image_type,
+        .flags = static_cast<VkImageCreateFlags>(flags),
+        .usage = static_cast<VkImageUsageFlags>(usage_flags),
+    };
+
     vk::PhysicalDeviceImageFormatInfo2 format_info{
         .format = supported_format,
-        .type = ConvertImageType(info.type),
+        .type = image_type,
         .tiling = tiling,
         .usage = usage_flags,
         .flags = flags,
     };
-    auto image_format_properties =
-        instance->GetPhysicalDevice().getImageFormatProperties2(format_info);
-    if (image_format_properties.result == vk::Result::eErrorFormatNotSupported &&
-        (usage_flags & vk::ImageUsageFlagBits::eStorage)) {
-        // Some drivers reject MutableFormat + ExtendedUsage + Storage for block-compressed
-        // formats (e.g. BC5/BC6H) even though Storage is only opportunistic here (used for
-        // uncompressed views of compressed images). Rather than proceeding and crashing in
-        // vmaCreateImage below, drop Storage and retry with the reduced usage set.
-        LOG_WARNING(Render_Vulkan,
+
+    vk::ResultValue<vk::ImageFormatProperties2> image_format_properties{vk::Result::eErrorUnknown,
+                                                                        {}};
+    {
+        std::scoped_lock lock{format_query_cache_mutex};
+        if (const auto it = format_query_cache.find(query_key); it != format_query_cache.end()) {
+            // Already resolved this exact (format, type, flags, usage) combination before:
+            // reuse the result instead of hitting the driver and re-logging the same message.
+            usage_flags = it->second.usage_flags;
+            format_features = it->second.format_features;
+            format_info.usage = usage_flags;
+            image_format_properties = it->second.properties;
+        } else {
+            image_format_properties =
+                instance->GetPhysicalDevice().getImageFormatProperties2(format_info);
+            if (image_format_properties.result == vk::Result::eErrorFormatNotSupported &&
+                (usage_flags & vk::ImageUsageFlagBits::eStorage)) {
+                // Some drivers reject MutableFormat + ExtendedUsage + Storage for block-compressed
+                // formats (e.g. BC5/BC6H) even though Storage is only opportunistic here (used for
+                // uncompressed views of compressed images). Rather than proceeding and crashing in
+                // vmaCreateImage below, drop Storage and retry with the reduced usage set.
+                LOG_WARNING(
+                    Render_Vulkan,
                     "image format {} type {} does not support usage {}, retrying without Storage",
                     vk::to_string(supported_format), vk::to_string(format_info.type),
                     vk::to_string(format_info.usage));
-        usage_flags &= ~vk::ImageUsageFlagBits::eStorage;
-        format_features = FormatFeatureFlags(usage_flags);
-        format_info.usage = usage_flags;
-        image_format_properties =
-            instance->GetPhysicalDevice().getImageFormatProperties2(format_info);
-    }
-    if (image_format_properties.result == vk::Result::eErrorFormatNotSupported) {
-        LOG_ERROR(Render_Vulkan, "image format {} type {} is not supported (flags {}, usage {})",
-                  vk::to_string(supported_format), vk::to_string(format_info.type),
-                  vk::to_string(format_info.flags), vk::to_string(format_info.usage));
+                usage_flags &= ~vk::ImageUsageFlagBits::eStorage;
+                format_features = FormatFeatureFlags(usage_flags);
+                format_info.usage = usage_flags;
+                image_format_properties =
+                    instance->GetPhysicalDevice().getImageFormatProperties2(format_info);
+            }
+            if (image_format_properties.result == vk::Result::eErrorFormatNotSupported) {
+                LOG_ERROR(Render_Vulkan,
+                         "image format {} type {} is not supported (flags {}, usage {})",
+                         vk::to_string(supported_format), vk::to_string(format_info.type),
+                         vk::to_string(format_info.flags), vk::to_string(format_info.usage));
+            }
+            format_query_cache.emplace(
+                query_key, FormatQueryResult{.usage_flags = usage_flags,
+                                             .format_features = format_features,
+                                             .properties = image_format_properties});
+        }
     }
     supported_samples = image_format_properties.result == vk::Result::eSuccess
                             ? image_format_properties.value.imageFormatProperties.sampleCounts
